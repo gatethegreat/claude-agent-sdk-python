@@ -378,11 +378,15 @@ class SubprocessCLITransport(Transport):
         if not self._process:
             return
 
-        # Close stderr task group if active
+        # Close stderr task group if active (with timeout to prevent hang)
         if self._stderr_task_group:
             with suppress(Exception):
                 self._stderr_task_group.cancel_scope.cancel()
-                await self._stderr_task_group.__aexit__(None, None, None)
+                try:
+                    with anyio.fail_after(2.0):
+                        await self._stderr_task_group.__aexit__(None, None, None)
+                except TimeoutError:
+                    logger.warning("Stderr task group cleanup timed out")
             self._stderr_task_group = None
 
         # Close streams
@@ -400,14 +404,36 @@ class SubprocessCLITransport(Transport):
             with suppress(Exception):
                 await self._process.stdin.aclose()
 
-        # Terminate and wait for process
+        # Terminate and wait for process with proper cleanup
+        # Fix: Add timeout and SIGKILL fallback to prevent orphaned subprocesses
         if self._process.returncode is None:
             with suppress(ProcessLookupError):
+                # First try graceful termination (SIGTERM)
                 self._process.terminate()
-                # Wait for process to finish with timeout
-                with suppress(Exception):
-                    # Just try to wait, but don't block if it fails
-                    await self._process.wait()
+
+                # Wait with timeout - if process doesn't die, force kill
+                try:
+                    with anyio.fail_after(3.0):  # 3 second grace period
+                        await self._process.wait()
+                except TimeoutError:
+                    # Process ignored SIGTERM, force kill with SIGKILL
+                    logger.warning(
+                        "Claude subprocess did not terminate gracefully, sending SIGKILL"
+                    )
+                    with suppress(ProcessLookupError):
+                        self._process.kill()
+                        # Wait for kill to complete
+                        try:
+                            with anyio.fail_after(2.0):
+                                await self._process.wait()
+                        except TimeoutError:
+                            logger.error(
+                                "Failed to kill Claude subprocess even with SIGKILL"
+                            )
+                except Exception:
+                    # Any other error - try to force kill anyway
+                    with suppress(ProcessLookupError, Exception):
+                        self._process.kill()
 
         self._process = None
         self._stdout_stream = None

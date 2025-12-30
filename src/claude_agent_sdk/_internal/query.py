@@ -538,9 +538,16 @@ class Query:
         self._closed = True
         if self._tg:
             self._tg.cancel_scope.cancel()
-            # Wait for task group to complete cancellation
+            # Wait for task group to complete cancellation WITH TIMEOUT
+            # Fix for: https://github.com/anthropics/claude-agent-sdk-python/issues/378
             with suppress(anyio.get_cancelled_exc_class()):
-                await self._tg.__aexit__(None, None, None)
+                try:
+                    with anyio.fail_after(5.0):
+                        await self._tg.__aexit__(None, None, None)
+                except TimeoutError:
+                    logger.warning(
+                        "Task group cleanup timed out after 5s - forcing transport close"
+                    )
         await self.transport.close()
 
     # Make Query an async iterator
